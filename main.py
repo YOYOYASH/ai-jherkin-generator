@@ -1,216 +1,138 @@
 import asyncio
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import uvicorn
-from urllib.parse import urlparse
-
+import traceback
+from fastapi import FastAPI
+from pydantic import BaseModel
+from urllib.parse import urljoin, urlparse
 from src.browser_manager import BrowserManager
 from src.element_analyzer import ElementAnalyzer
 from src.llm_service import LLMService
 from src.gherkin_generator import GherkinGenerator
 
-app = FastAPI(
-    title="AI Gherkin Automation",
-    description="An AI-based solution to dynamically generate Gherkin-style testing scenarios for websites.",
-    version="1.0.0"
-)
+app = FastAPI()
 
 class URLInput(BaseModel):
     url: str
 
-
-@app.post("/generate-tests", summary="Generate Gherkin tests for a URL")
+@app.post("/generate-tests")
 async def generate_tests(item: URLInput):
-    gherkin_scenarios = []
     browser = BrowserManager()
+    hover_scenarios = []
+    popup_scenarios = []
 
     try:
-        print(f"\n{'='*60}")
-        print(f"Starting test generation for: {item.url}")
-        print(f"{'='*60}\n")
-
+        print(f"STARTING FULL ANALYSIS: {item.url}")
+        
         await browser.start()
         await browser.go_to(item.url)
+        
+        print("  -> Scrolling to load lazy content...")
+        await browser.scroll_to_bottom()
+        
+        content = await browser.get_page_content()
+        analyzer = ElementAnalyzer(content)
+        elements = analyzer.find_potential_interactive_elements(item.url)
+        
+        print(f"Found {len(elements)} interactive candidates.")
 
-        initial_content = await browser.get_page_content()
-        analyzer = ElementAnalyzer(initial_content)
-        interactive_elements = analyzer.find_potential_interactive_elements()
+        # ==========================================================
+        # PHASE 1: HOVER TESTS
+        # ==========================================================
+        print("\n--- PHASE 1: Hover Tests ---")
+        nav_items = [e for e in elements if e.get('type') == 'nav']
+        
+        hover_count = 0
+        for el in nav_items[:20]:
+            if hover_count >= 5: break 
+            if not await browser.is_element_visible(el): continue
 
-        print(f"Found {len(interactive_elements)} potential interactive elements")
-
-        # ------------------------------------------------------------
-        # PHASE 1: POPUPS / CLICK INTERACTIONS
-        # ------------------------------------------------------------
-        clickable_elements = [el for el in interactive_elements if el['tag'] in ['a', 'button']]
-        popup_found = False
-
-        for idx, element_data in enumerate(clickable_elements[:20], 1):
-            print(f"\n[{idx}] Testing click on: '{element_data.get('text')[:60]}...'")
-
-            try:
-                await browser.go_to(item.url)
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"  ✗ Failed to navigate: {e}")
-                continue
-
-            try:
-                changes = await browser.click_and_get_changes(element_data)
-
-                if changes.get('skipped'):
-                    print("  → Skipped external navigation link")
-                    continue
-                if changes.get('navigated'):
-                    print("  → Click caused navigation; skipping for popup detection")
-                    continue
-
-                modal_details = ElementAnalyzer.analyze_modal_dialog(changes['initial'], changes['final'])
-                if modal_details and modal_details['buttons']:
-                    print(f"  ✓ Found modal: '{modal_details['title']}'")
-
-                    interaction_data = {
-                        'url': item.url,
-                        'type': 'popup',
-                        'click_element': element_data,
-                        'modal': modal_details
-                    }
-
-                    llm = LLMService()
-                    scenario = llm.generate_gherkin_scenario(interaction_data)
-                    if scenario:
-                        gherkin_scenarios.append(scenario)
-                        popup_found = True
-                        print("  ✓ Generated Gherkin scenario for popup")
-                        break
-                else:
-                    print("  ✗ No modal detected")
-
-            except Exception as e:
-                print(f"  ✗ Error testing element: {e}")
-                continue
-
-        if not popup_found:
-            print("\n⚠ No popup/modal interactions found")
-
-        # ------------------------------------------------------------
-        # PHASE 2: HOVER INTERACTIONS
-        # ------------------------------------------------------------
-        try:
+            print(f"Testing Hover: {el['text']}")
             await browser.go_to(item.url)
-            await asyncio.sleep(1)
-            initial_content = await browser.get_page_content()
-            analyzer = ElementAnalyzer(initial_content)
-            interactive_elements = analyzer.find_potential_interactive_elements()
-        except Exception as e:
-            print(f"✗ Failed to reset page for hover tests: {e}")
-            interactive_elements = []
+            
+            changes = await browser.hover_and_get_changes(el)
+            
+            # FIX: Use 'initial_visible' set for detection
+            initial_visible_set = changes.get('initial_visible', set())
+            
+            new_links = ElementAnalyzer.compare_doms(initial_visible_set, changes['final'])
+            
+            if new_links:
+                target = new_links[0]
+                target['href'] = urljoin(item.url, target['href'])
+                print(f"  -> Menu Revealed: {target['text']}")
+                
+                llm = LLMService()
+                scenario = llm.generate_gherkin_scenario({
+                    "url": item.url,
+                    "type": "hover",
+                    "hover_element": el,
+                    "target_link": target
+                })
+                if scenario and "Scenario:" in scenario:
+                    hover_scenarios.append(scenario)
+                    hover_count += 1
 
-        hover_found = False
+        # ==========================================================
+        # PHASE 2: POPUP TESTS
+        # ==========================================================
+        print("\n--- PHASE 2: Popup Tests ---")
+        trigger_items = [e for e in elements if e.get('type') == 'trigger']
+        
+        popup_count = 0
+        for el in trigger_items:
+            if popup_count >= 10: break
+            if not await browser.is_element_visible(el): continue
 
-        for idx, element_data in enumerate(interactive_elements[:30], 1):
-            print(f"\n[{idx}] Testing hover on: '{element_data.get('text')[:60]}...'")
-
-            try:
-                changes = await browser.hover_and_get_changes(element_data)
-                newly_appeared = ElementAnalyzer.compare_doms(changes['initial'], changes['final'])
-
-                if not newly_appeared:
-                    print("  → No obvious new text elements, trying structural diff fallback")
-                    newly_appeared = ElementAnalyzer.compare_doms(changes['initial'], changes['final'])
-
-                if newly_appeared:
-                    print(f"  ✓ Found {len(newly_appeared)} new elements")
-
-                    interaction_data = {
-                        'url': item.url,
-                        'type': 'hover',
-                        'hover_element': element_data,
-                        'revealed_elements': newly_appeared
-                    }
-
-                    llm = LLMService()
-                    scenario = llm.generate_gherkin_scenario(interaction_data)
-                    if scenario:
-                        gherkin_scenarios.append(scenario)
-                        hover_found = True
-                        print("  ✓ Generated Gherkin scenario for hover")
-                        break
-                else:
-                    print("  ✗ No new elements revealed")
-
-            except Exception as e:
-                print(f"  ✗ Error testing hover: {e}")
+            print(f"Testing Click: {el['text']} (href: {el.get('href', 'n/a')})")
+            await browser.go_to(item.url)
+            changes = await browser.click_and_get_changes(el)
+            
+            if changes['navigated']:
+                print("  -> Navigated away.")
                 continue
-
-        if not hover_found:
-            print("\n⚠ No hover menu interactions found")
+            
+            modal = ElementAnalyzer.analyze_modal_dialog(changes['initial'], changes['final'])
+            if modal:
+                print(f"  -> POPUP DETECTED: {modal['title']}")
+                
+                llm = LLMService()
+                scenario = llm.generate_gherkin_scenario({
+                    "url": item.url,
+                    "type": "popup",
+                    "click_element": el,
+                    "modal": modal
+                })
+                
+                if scenario and "Scenario:" in scenario:
+                    popup_scenarios.append(scenario)
+                    popup_count += 1
 
     except Exception as e:
-        print(f"\n✗ Error during test generation: {e}")
-        import traceback
+        print(f"CRITICAL ERROR: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
+    
     finally:
-        try:
-            await browser.close()
-        except Exception:
-            pass
+        print("Analysis Complete. Closing Browser...")
+        await browser.close()
 
-    # ------------------------------------------------------------
-    # RESULT HANDLING
-    # ------------------------------------------------------------
-    if not gherkin_scenarios:
-        print("\n" + "="*60)
-        print("RESULT: Could not generate any test scenarios")
-        print("="*60)
-        return {
-            'message': 'Could not generate any test scenarios for the given URL.',
-            'details': 'No interactive elements (hover menus or popups) were detected on the page.'
-        }
+    # ==========================================================
+    # SAVE FILES
+    # ==========================================================
+    response_data = {"status": "success", "files": []}
+    domain = urlparse(item.url).netloc
+    gen = GherkinGenerator()
 
-    # ------------------------------------------------------------
-    # SAVE FEATURE FILE
-    # ------------------------------------------------------------
-    try:
-        domain = urlparse(item.url).netloc
-        feature_title = f"Feature: Automated tests for {domain}"
-        full_feature_content = f"{feature_title}\n\n" + "\n\n".join(gherkin_scenarios)
+    if hover_scenarios:
+        hover_text = f"Feature: Navigation Menu Tests for {domain}\n\n" + "\n\n".join(hover_scenarios)
+        hover_path = gen.save_feature_file(item.url, hover_text, test_type="hover")
+        response_data["files"].append({"type": "hover", "path": hover_path})
 
-        generator = GherkinGenerator()
-        filepath = generator.save_feature_file(item.url, full_feature_content)
+    if popup_scenarios:
+        popup_text = f"Feature: Modal/Popup Tests for {domain}\n\n" + "\n\n".join(popup_scenarios)
+        popup_path = gen.save_feature_file(item.url, popup_text, test_type="popup")
+        response_data["files"].append({"type": "popup", "path": popup_path})
 
-        print(f"\n✓ Successfully saved feature file")
-        print(f"  Path: {filepath}")
-        print(f"  Scenarios generated: {len(gherkin_scenarios)}")
+    return response_data if response_data["files"] else {"status": "failed", "message": "No scenarios generated."}
 
-        return {
-            'message': 'Test generation complete.',
-            'feature_file': filepath,
-            'scenarios_count': len(gherkin_scenarios),
-            'scenarios': gherkin_scenarios
-        }
-
-    except Exception as e:
-        print(f"\n✗ Failed to save feature file: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save feature file: {e}")
-
-
-@app.get("/")
-async def root():
-    return {
-        'message': 'AI Gherkin Test Generator API',
-        'version': '1.0.0',
-        'endpoints': {
-            'generate_tests': '/generate-tests (POST)',
-            'docs': '/docs',
-            'redoc': '/redoc'
-        }
-    }
-
-
-if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("AI GHERKIN TEST GENERATOR")
-    print("="*60)
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

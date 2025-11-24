@@ -1,221 +1,131 @@
 from bs4 import BeautifulSoup, Tag
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
+from urllib.parse import urlparse
 
 class ElementAnalyzer:
-    """
-    Analyzes HTML content to find interactive elements and differences in DOM structure.
-    """
-
     def __init__(self, html_content: str):
         self.soup = BeautifulSoup(html_content, 'lxml')
 
-    def find_potential_interactive_elements(self) -> List[Dict[str, Any]]:
-        """
-        Finds elements that are likely to be interactive (hoverable or clickable).
-        """
-        interactive_elements = []
-        selectors = [
-            "nav a", "nav button", "nav li",
-            "header a", "header button",
-            "[role='button']", "[role='menuitem']",
-            "a[href]", "button",
-            "div[onclick]", "div[onmouseover]",
-            "[class*='menu']", "[class*='nav']",
-            "[class*='dropdown']", "[class*='link']"
-        ]
+    def find_potential_interactive_elements(self, current_url: str = "") -> List[Dict[str, Any]]:
+        elements = []
+        seen_items = set() 
+        current_domain = urlparse(current_url).netloc if current_url else ""
 
-        found_elements: Set[Tag] = set()
+        # --- 1. HOVER CANDIDATES ---
+        nav_candidates = self.soup.find_all(['nav', 'header'])
+        for div in self.soup.find_all(['div', 'ul']):
+            classes = str(div.get('class', [])).lower()
+            if 'menu' in classes or 'nav' in classes:
+                nav_candidates.append(div)
 
-        for selector in selectors:
-            try:
-                elements = self.soup.select(selector)
-            except Exception:
-                elements = []
-            for element in elements:
-                if element not in found_elements:
-                    found_elements.add(element)
+        for container in nav_candidates:
+            for el in container.find_all(['a', 'span', 'li', 'button']):
+                text = self._clean_text(el)
+                href = el.get('href', '')
+                
+                if not text or len(text) < 2: continue
+                unique_key = (text, href)
+                if unique_key in seen_items: continue
+                
+                elements.append({"text": text, "tag": el.name, "type": "nav", "href": href})
+                seen_items.add(unique_key)
 
-        for element in found_elements:
-            text = self._get_element_text(element)
-            if text and len(text) < 200:
-                interactive_elements.append({
-                    "text": text,
-                    "tag": element.name,
-                    "classes": element.get('class', []),
-                    "id": element.get('id', '')
-                })
+        # --- 2. POPUP CANDIDATES ---
+        all_interactives = self.soup.find_all(['a', 'button', 'input'])
+        
+        for el in all_interactives:
+            if el.name == 'input' and el.get('type') not in ['submit', 'button']: continue
 
-        # Fallback: if nothing found, try headings + nav
-        if not interactive_elements:
-            for el in self.soup.find_all(['a', 'button']):
-                text = self._get_element_text(el)
-                if text:
-                    interactive_elements.append({
-                        "text": text,
-                        "tag": el.name,
-                        "classes": el.get('class', []),
-                        "id": el.get('id', '')
-                    })
+            text = self._clean_text(el)
+            href = el.get('href', '')
+            unique_key = (text, href)
 
-        return interactive_elements
+            if not text: continue
+            if unique_key in seen_items: continue
+            if len(text) > 60: continue 
 
-    def _get_element_text(self, element: Tag) -> str:
-        text = element.get_text(strip=True)
-        return ' '.join(text.split())
+            noise = ["skip to", "video unavailable", "loading", "advertisement"]
+            if any(w in text.lower() for w in noise): continue
+
+            elements.append({
+                "text": text, 
+                "tag": el.name, 
+                "type": "trigger", 
+                "href": href
+            })
+            seen_items.add(unique_key)
+
+        return elements
+
+    def _clean_text(self, el):
+        return ' '.join(el.get_text(separator=' ', strip=True).split())
 
     @staticmethod
-    def compare_doms(initial_html: str, final_html: str) -> List[Dict[str, Any]]:
+    def compare_doms(initial_visible_texts: Set[str], final_html: str) -> List[Dict[str, Any]]:
         """
-        Compares two HTML documents and identifies new, visible elements.
-        Improved: structural + text diff fallback.
+        Identifies links in the final HTML that were NOT visible initially.
+        Uses the 'Visible Text' set from BrowserManager for accuracy.
         """
-        initial_soup = BeautifulSoup(initial_html, 'lxml')
         final_soup = BeautifulSoup(final_html, 'lxml')
-
-        initial_texts = set()
-        for tag in initial_soup.find_all(True):
-            text = tag.get_text(strip=True)
-            if text:
-                initial_texts.add(text)
-
         new_elements = []
-        seen_texts = set()
 
-        # Prefer links and buttons that are visible and new by text
-        for tag in final_soup.find_all(['a', 'button', 'div', 'span']):
-            try:
-                text = tag.get_text(strip=True)
-            except Exception:
-                text = ''
-            if not text or text in seen_texts:
-                continue
-            if text not in initial_texts:
-                href = ''
-                if tag.name == 'a':
-                    href = tag.get('href', '')
-                elif tag.find_parent('a'):
-                    href = tag.find_parent('a').get('href', '')
+        IGNORE = ["video", "supported", "unavailable", "loading", "advertisement"]
+
+        for tag in final_soup.find_all('a', href=True):
+            raw_text = tag.get_text(separator=' ', strip=True)
+            text = ' '.join(raw_text.split())
+            
+            if not text: continue
+            if any(x in text.lower() for x in IGNORE): continue
+
+            # CRITICAL CHECK: Was this text visible before?
+            # We assume if the text wasn't in the initial visible set, it's new.
+            if text not in initial_visible_texts:
                 new_elements.append({
-                    "text": text,
-                    "tag": tag.name,
-                    "href": href,
-                    "classes": tag.get('class', [])
+                    "text": text, 
+                    "tag": "a", 
+                    "href": tag['href']
                 })
-                seen_texts.add(text)
-
-        # Structural diff fallback: detect new tag/class combos
-        if not new_elements:
-            initial_tags = {(t.name, tuple(t.get('class', []))) for t in initial_soup.find_all(True)}
-            final_tags = {(t.name, tuple(t.get('class', []))) for t in final_soup.find_all(True)}
-            new_struct = final_tags - initial_tags
-            for tag_name, classes in list(new_struct)[:10]:
-                new_elements.append({
-                    "text": "",
-                    "tag": tag_name,
-                    "href": "",
-                    "classes": list(classes) if classes else []
-                })
-
         return new_elements
 
     @staticmethod
     def analyze_modal_dialog(initial_html: str, final_html: str) -> Dict[str, Any] | None:
-        """
-        Analyzes the difference between two HTML states to find a modal dialog.
-        Improved to include fallback heuristics for portals and large overlays.
-        """
         initial_soup = BeautifulSoup(initial_html, 'lxml')
         final_soup = BeautifulSoup(final_html, 'lxml')
+        initial_text_blob = initial_soup.get_text()
+        
+        candidates = final_soup.select("div[role='dialog'], div[class*='modal'], div[class*='popup'], aside")
+        if not candidates:
+            candidates = final_soup.find_all('div')
 
-        initial_texts = set()
-        for el in initial_soup.find_all(True):
-            text = el.get_text(strip=True)
-            if text:
-                initial_texts.add(text)
+        for cand in candidates:
+            text = cand.get_text(separator=' ', strip=True)
+            if not text or len(text) < 15: continue
+            if "video" in text.lower(): continue 
 
-        modal_selectors = [
-            "[role='dialog']",
-            "[role='alertdialog']",
-            ".modal",
-            ".popup",
-            ".dialog",
-            "[class*='modal']",
-            "[class*='popup']",
-            "[class*='dialog']",
-            "[class*='overlay']",
-            "div[style*='fixed']",
-            "div[style*='absolute']",
-        ]
+            if text not in initial_text_blob:
+                btns = cand.find_all(['button', 'a'])
+                safe_buttons = []
+                for b in btns:
+                    t = b.get_text(strip=True)
+                    if t: safe_buttons.append({"text": t})
+                
+                btn_str = ' '.join([b['text'].lower() for b in safe_buttons])
+                
+                if any(x in btn_str for x in ['cancel', 'close', 'ok', 'continue', 'stay', 'leave', 'yes', 'no']):
+                    
+                    title_el = cand.find(['h1', 'h2', 'h3', 'h4', 'strong', 'b'])
+                    if title_el:
+                        final_title = title_el.get_text(strip=True)
+                    else:
+                        raw_text = cand.get_text(separator=' ', strip=True)
+                        for btn in safe_buttons:
+                            raw_text = raw_text.replace(btn['text'], "")
+                        final_title = ' '.join(raw_text.split())
+                        if len(final_title) > 80: final_title = final_title[:80] + "..."
 
-        potential_modals = []
-        for selector in modal_selectors:
-            try:
-                potential_modals.extend(final_soup.select(selector))
-            except Exception:
-                continue
-
-        modal_container = None
-        for el in potential_modals:
-            el_text = el.get_text(strip=True)
-            if el_text and len(el_text) > 10:
-                words = el_text.split()
-                # New word heuristic: % of words not present in initial DOM
-                new_words = sum(1 for w in words if all(w not in t for t in initial_texts))
-                if new_words > max(1, len(words) * 0.25):
-                    modal_container = el
-                    break
-
-        # Fallback: find large new div/section not present before
-        if not modal_container:
-            for tag in final_soup.find_all(['div', 'section', 'aside']):
-                tag_text = tag.get_text(strip=True)
-                if tag_text and len(tag_text) > 30 and tag_text not in initial_texts:
-                    modal_container = tag
-                    break
-
-        if not modal_container:
-            return None
-
-        # Extract modal details
-        modal_title = ""
-        for heading in ['h1', 'h2', 'h3', 'h4']:
-            title_el = modal_container.find(heading)
-            if title_el:
-                modal_title = title_el.get_text(strip=True)
-                break
-
-        if not modal_title:
-            # first significant child text
-            for child in modal_container.children:
-                if hasattr(child, 'get_text'):
-                    t = child.get_text(strip=True)
-                    if t and 1 < len(t) < 200:
-                        modal_title = t
-                        break
-
-        modal_text = modal_container.get_text(strip=True)
-
-        # find buttons/links inside modal
-        buttons = []
-        button_elements = modal_container.select("button, a[role='button'], a, input[type='button'], input[type='submit']")
-        seen_button_texts = set()
-        for btn in button_elements:
-            btn_text = btn.get_text(strip=True)
-            if btn_text and btn_text not in seen_button_texts and len(btn_text) < 80:
-                buttons.append({
-                    "text": btn_text,
-                    "tag": btn.name,
-                    "type": btn.get('type', ''),
-                    "href": btn.get('href', '')
-                })
-                seen_button_texts.add(btn_text)
-
-        return {
-            "title": modal_title,
-            "full_text": modal_text,
-            "buttons": buttons
-        }
-
-
-if __name__ == "__main__":
-    pass
+                    return {
+                        "title": final_title,
+                        "buttons": safe_buttons
+                    }
+        return None
